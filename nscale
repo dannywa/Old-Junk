@@ -1,0 +1,235 @@
+#!/usr/bin/perl
+#
+# vim: ts=8 sts=4 sw=4 noet syntax=perl
+#
+use strict;
+use warnings;
+use Carp;
+use Image::Magick;
+
+our $file;
+
+use Cwd qw/abs_path/;
+use File::Temp qw/mkstemp/;
+use File::Basename qw/basename/;
+use FindBin qw/$Bin $Script/;
+use Getopt::Std qw/getopts/;
+use Pod::Usage qw/pod2usage/;
+
+# for clean-up
+$SIG{INT} = $SIG{TERM} = sub {
+    unlink $file if $file;
+    die "$Script\[$$]: caught SIG$_[0]\n";
+};
+
+# for statistics
+my $in_cnt     = 0;
+my $stored_cnt = 0;
+my $err_cnt    = 0;
+
+my %opts;
+my $base_dir = q(/cygdrive/n/nf);
+#my $base_dir = q(./scaled);
+my $width = 800;
+my $height = 480;
+
+#-----------------------------------------------------------------------
+# scale an image
+#-----------------------------------------------------------------------
+
+sub scale {
+    my ($full, $dir, $x, $y) = @_;
+
+    unless (-f $full && -r $full) {
+	my ($err, $errstr) = (0+$!, "$full: $!");
+	report_error($full, $err, " No source file");
+	return $err;
+    }
+
+    my $file;
+    if (!-d $dir && -e $dir && -w $dir) { $file = $dir; }
+    else {
+        $file = $dir;
+        system qw/mkdir -p/, $file and die "Scale.pm can't mkdir $file\n"
+		unless -d $file;
+        $file .= '/' . basename($full);
+    }
+    chmod 0666 & ~umask, $file;
+
+    # load the file
+    my $im = Image::Magick->new();
+    my $rc = $im->Read($full);
+
+    if ("$rc") {
+	report_error($full, $rc, "On create");
+	unlink $file;
+	my ($code) = $rc =~ /(\d+)/;
+	return $code;
+    }
+
+    # scale it
+    my ($width, $height) = $im->Get('columns', 'rows');
+
+    unless ($width && $height) {
+	report_error($full, 255<<8, "No image dims");
+	unlink $file;
+	return 1;
+    }
+
+    #These are the width and height passed in
+    my $desired_x = $x;
+    my $desired_y = $y;
+
+    if ($x && $y) {
+	#undef the height so the appropriate conditional below is used
+	if ( $x / $width < $y / $height ) { undef ($y);	}
+	#undef the width so the appropriate conditional below is used
+	else { undef ($x); }
+    }
+	
+    #We have a desired width but not height.  Calculate height based on width
+    if ($x && !$y) {
+#	$y = sprintf("%.0f", $x * ($height / $width));
+	$y = int($x * ($height / $width));
+    #We have a desired height but not width.  Calculate width based on height
+    } elsif ($y && !$x) {
+	$x = int($y * ($width / $height));
+    #We don't have a width or a height.  Throw an error
+    } elsif (!$x && !$y) {
+	report_error($full, 255<<8, "No scale reqs");
+	return 1;
+    }
+
+    # Normalize the image
+    $rc = $im->Normalize(channel => 'all');
+    if ("$rc") {
+	report_error($full, $rc, "On normalize");
+	unlink $file;
+	my ($code) = $rc =~ /(\d+)/;
+	return $code;
+    }
+
+    # Scale the image if needed
+    $rc = $im->Scale(width => $x, height => $y)
+	if $width > $x or $height > $y;
+    if ("$rc") {
+	report_error($full, $rc, "On scale");
+	unlink $file;
+	my ($code) = $rc =~ /(\d+)/;
+	return $code;
+    }
+
+
+    # Border if needed to fit a box
+    my $needsBorder = 0;
+    my $bwidth = 0;
+    my $bheight = 0;
+
+    if ($desired_x > $x) {
+	$needsBorder = 1;
+	$bwidth = sprintf("%.0f", ($desired_x - $x ) / 2);
+    }
+    if ($desired_y > $y) {
+	$needsBorder = 1;
+	$bheight = sprintf("%.0f", ($desired_y - $y) / 2);
+    }	
+
+    #Border the image if needsBorder
+    $rc = $im->Border(width=>$bwidth,height=>$bheight,fill=>'black')
+	if $needsBorder;
+
+    if ("$rc") {
+	report_error($full, $rc, "On border");
+	unlink $file;
+	my ($code) = $rc =~ /(\d+)/;
+	return $code;
+    }
+
+    # write it
+    $rc = $im->Write($file);
+
+    if ("$rc") {
+		report_error($full, $rc, "on write");
+		unlink $file;
+	my ($code) = $rc =~ /(\d+)/;
+	return $code;
+    }
+
+    $rc;
+}
+
+
+#-----------------------------------------------------------------------
+# some Image::Magick function had an error
+#-----------------------------------------------------------------------
+
+sub report_error {
+    my ($full, $rc, $msg) = @_;
+
+    my $code = ($rc =~ /(\d+)/) ? $1 : 255<<8;
+
+    warn "$Script\[$$]: ($code) $full: $msg\n";
+}
+
+{
+    #-----------------------------------------------------------------
+    # process command line
+    #-----------------------------------------------------------------
+
+    getopts('f:n:l:h:', \%opts) || pod2usage();
+    pod2usage() if @ARGV;
+
+
+}
+
+#---------------------------------------------------------------------
+# do scaling
+#---------------------------------------------------------------------
+
+my $handle = $opts{h};
+my $lastfilename;
+
+
+#---------------------------------------------------------------------
+# This routine can perform one of two actions:
+# 	Scale an image on the fly if $opts{h} is provided
+# 	Or it queries the webservice to get an image to scale.
+#
+# If $opts{h} is provided and the scaling is successful, only the 
+# file name of the scaled image is written to STDOUT so that the caller
+# can trap that info.  Also, the loop variable is set to 1 if $opts{h}
+#---------------------------------------------------------------------
+
+#Set to loop only once if a handle is provided
+if ($handle) { $opts{n} = 1; }
+
+while (1) {
+    last if $opts{n} && $in_cnt >= $opts{n};
+
+    my $file = $handle ? $handle : <>;
+    last unless $file;
+    chomp($file);
+
+    $in_cnt++;
+
+    my $resp = scale($file, $base_dir, $width, $height);
+
+    if ($resp) {
+	$err_cnt++;
+	next;
+    }
+    $lastfilename = "";
+    $stored_cnt++;
+}
+
+print_counts();
+exit($err_cnt ? 1 : 0);
+
+sub print_counts {
+    print  "$Script\[$$]: totals:\n"            if $in_cnt;
+    printf "\t%7d images in\n",     $in_cnt     if $in_cnt;
+    printf "\t%7d images scaled\n", $stored_cnt if $stored_cnt;
+    printf "\t%7d errors\n",        $err_cnt    if $err_cnt;
+}
+
+__END__
